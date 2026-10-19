@@ -1,0 +1,457 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "celeborn/client/reader/CelebornInputStream.h"
+#include <lz4.h>
+#include <thread>
+#include "CelebornInputStream.h"
+#include "celeborn/client/ShuffleClient.h"
+#include "celeborn/client/compress/Decompressor.h"
+#include "celeborn/utils/CelebornUtils.h"
+
+namespace celeborn {
+namespace client {
+CelebornInputStream::CelebornInputStream(
+    const std::string& shuffleKey,
+    const std::shared_ptr<const conf::CelebornConf>& conf,
+    const std::shared_ptr<network::TransportClientFactory>& clientFactory,
+    std::vector<std::shared_ptr<const protocol::PartitionLocation>>&& locations,
+    const std::vector<int>& attempts,
+    int attemptNumber,
+    int startMapIndex,
+    int endMapIndex,
+    bool needCompression,
+    const std::shared_ptr<FetchExcludedWorkers>& fetchExcludedWorkers,
+    ShuffleClient* shuffleClient,
+    std::shared_ptr<const protocol::PartitionPushFailedBatches>
+        pushFailedBatches)
+    : shuffleKey_(shuffleKey),
+      conf_(conf),
+      clientFactory_(clientFactory),
+      locations_(std::move(locations)),
+      attempts_(attempts),
+      attemptNumber_(attemptNumber),
+      startMapIndex_(startMapIndex),
+      endMapIndex_(endMapIndex),
+      currLocationIndex_(0),
+      currBatchPos_(0),
+      currBatchSize_(0),
+      shouldDecompress_(
+          conf_->shuffleCompressionCodec() !=
+              protocol::CompressionCodec::NONE &&
+          needCompression),
+      fetchChunkRetryCnt_(0),
+      fetchChunkMaxRetry_(
+          conf_->clientPushReplicateEnabled()
+              ? conf_->clientFetchMaxRetriesForEachReplica() * 2
+              : conf_->clientFetchMaxRetriesForEachReplica()),
+      retryWait_(conf_->networkIoRetryWait()),
+      fetchExcludedWorkers_(fetchExcludedWorkers),
+      fetchExcludedWorkerExpireTimeoutMs_(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              conf_->clientFetchExcludedWorkerExpireTimeout())
+              .count()),
+      readSkewPartitionWithoutMapRange_(
+          conf_->clientAdaptiveOptimizeSkewedPartitionReadEnabled() &&
+          startMapIndex > endMapIndex),
+      pushFailedBatches_(std::move(pushFailedBatches)),
+      shuffleClient_(shuffleClient) {
+  if (shouldDecompress_) {
+    decompressor_ = compress::Decompressor::createDecompressor(
+        conf_->shuffleCompressionCodec());
+  }
+  moveToNextReader();
+}
+
+CelebornInputStream::CelebornInputStream()
+    : attemptNumber_(0),
+      startMapIndex_(0),
+      endMapIndex_(0),
+      shouldDecompress_(false),
+      currLocationIndex_(0),
+      currBatchPos_(0),
+      currBatchSize_(0),
+      fetchChunkRetryCnt_(0),
+      fetchChunkMaxRetry_(0),
+      retryWait_(utils::MS::zero()),
+      fetchExcludedWorkerExpireTimeoutMs_(0),
+      readSkewPartitionWithoutMapRange_(false),
+      shuffleClient_(nullptr) {}
+
+std::unique_ptr<CelebornInputStream> CelebornInputStream::empty() {
+  // Private constructor: not reachable via make_unique.
+  return std::unique_ptr<CelebornInputStream>(new CelebornInputStream());
+}
+
+int CelebornInputStream::read(uint8_t* buffer, size_t offset, size_t len) {
+  CELEBORN_CHECK_NOT_NULL(buffer);
+  uint8_t* buf = buffer + offset;
+  if (len <= 0)
+    return 0;
+
+  size_t readBytes = 0;
+  while (readBytes < len) {
+    while (currBatchPos_ >= currBatchSize_) {
+      if (!fillBuffer()) {
+        return readBytes > 0 ? readBytes : -1;
+      }
+    }
+    size_t batchRemainingSize = currBatchSize_ - currBatchPos_;
+    size_t toReadBytes = std::min(len - readBytes, batchRemainingSize);
+    CELEBORN_CHECK_GE(decompressedChunk_->remainingSize(), toReadBytes);
+    auto size = decompressedChunk_->readToBuffer(&buf[readBytes], toReadBytes);
+    CELEBORN_CHECK_EQ(toReadBytes, size);
+    readBytes += toReadBytes;
+    currBatchPos_ += toReadBytes;
+  }
+  return readBytes;
+}
+
+bool CelebornInputStream::fillBuffer() {
+  if (!currChunk_) {
+    return false;
+  }
+
+  bool hasData = false;
+  while (currChunk_->remainingSize() > 0 || moveToNextChunk()) {
+    CELEBORN_CHECK_GE(currChunk_->remainingSize(), 4 * 4);
+    // TODO: in java this is UNSAFE and PLATFORM related. hand-crafted here,
+    // might not be safe.
+    int mapId = currChunk_->readLE<int>();
+    int attemptId = currChunk_->readLE<int>();
+    int batchId = currChunk_->readLE<int>();
+    int size = currChunk_->readLE<int>();
+    CELEBORN_CHECK_GE(currChunk_->remainingSize(), size);
+    CELEBORN_CHECK_LT(mapId, attempts_.size());
+
+    // Consume the body once, before any skip decision, so the cursor always
+    // lands on the next batch header (like the Java reader, which `continue`s
+    // on skipped batches).
+    std::unique_ptr<memory::ReadOnlyByteBuffer> rawBatch;
+    if (shouldDecompress_) {
+      if (size > compressedBuf_.size()) {
+        compressedBuf_.resize(size);
+      }
+      currChunk_->readToBuffer(compressedBuf_.data(), size);
+    } else {
+      rawBatch = currChunk_->readToReadOnlyBuffer(size);
+    }
+
+    // Drop a batch from a stale (non-winning) map attempt.
+    if (attemptId != attempts_[mapId]) {
+      continue;
+    }
+    // Skip batches pushed, failed, then retried on another worker, to avoid
+    // duplicates (like the Java reader); only for a skew partition without a
+    // map range. The emptiness check keeps uniqueId() off the common path.
+    if (readSkewPartitionWithoutMapRange_ && pushFailedBatches_ &&
+        !pushFailedBatches_->empty() &&
+        isPushFailedBatch(
+            currReader_->getLocation().uniqueId(), mapId, attemptId, batchId)) {
+      LOG(WARNING) << "Skip duplicated batch: mapId=" << mapId
+                   << ", attemptId=" << attemptId << ", batchId=" << batchId
+                   << ".";
+      continue;
+    }
+    auto& batchRecord = getBatchRecord(mapId);
+    if (batchRecord.count(batchId) > 0) {
+      continue;
+    }
+    batchRecord.insert(batchId);
+    if (shouldDecompress_) {
+      const auto originalLength =
+          decompressor_->getOriginalLen(compressedBuf_.data());
+      std::unique_ptr<folly::IOBuf> decompressedBuf_ =
+          folly::IOBuf::createCombined(originalLength);
+      decompressedBuf_->append(originalLength);
+      currBatchSize_ = decompressor_->decompress(
+          compressedBuf_.data(), decompressedBuf_->writableData(), 0);
+      decompressedChunk_ = memory::ByteBuffer::createReadOnly(
+          std::move(decompressedBuf_), false);
+    } else {
+      currBatchSize_ = size;
+      decompressedChunk_ = std::move(rawBatch);
+    }
+    currBatchPos_ = 0;
+    hasData = true;
+    break;
+  }
+
+  return hasData;
+}
+
+bool CelebornInputStream::moveToNextChunk() {
+  currChunk_.reset();
+
+  if (currReader_->hasNext()) {
+    currChunk_ = getNextChunk();
+    if (currChunk_) {
+      return true;
+    }
+  }
+  if (currLocationIndex_ < locations_.size()) {
+    moveToNextReader();
+    return currReader_ != nullptr;
+  }
+  cleanupReader();
+  return false;
+}
+
+std::unique_ptr<memory::ReadOnlyByteBuffer>
+CelebornInputStream::getNextChunk() {
+  while (fetchChunkRetryCnt_ < fetchChunkMaxRetry_) {
+    try {
+      if (isExcluded(currReader_->getLocation())) {
+        CELEBORN_FAIL(
+            "Fetch data from excluded worker! {}",
+            currReader_->getLocation().hostAndFetchPort());
+      }
+      if (!currReader_->hasNext()) {
+        return nullptr;
+      }
+      auto chunk = currReader_->next();
+      verifyChunk(chunk);
+      return std::move(chunk);
+    } catch (const std::exception& e) {
+      auto failedLocation = currReader_->getLocation();
+      shuffleClient_->excludeFailedFetchLocation(
+          failedLocation.hostAndFetchPort(), e);
+      fetchChunkRetryCnt_++;
+      currReader_ = nullptr;
+
+      if (fetchChunkRetryCnt_ == fetchChunkMaxRetry_) {
+        CELEBORN_FAIL(
+            "Fetch chunk failed for {} times for location {}. Error: {}",
+            fetchChunkRetryCnt_,
+            failedLocation.hostAndFetchPort(),
+            e.what());
+      }
+
+      if (failedLocation.hasPeer() && !readSkewPartitionWithoutMapRange_) {
+        LOG(WARNING) << "Fetch chunk failed " << fetchChunkRetryCnt_ << "/"
+                     << fetchChunkMaxRetry_ << " times for location "
+                     << failedLocation.hostAndFetchPort()
+                     << ", change to peer. Error: " << e.what();
+        // fetchChunkRetryCnt_ % 2 == 0 means both replicas have been tried,
+        // so sleep before next try.
+        if (fetchChunkRetryCnt_ % 2 == 0) {
+          std::this_thread::sleep_for(retryWait_);
+        }
+        currReader_ = createReaderWithRetry(*failedLocation.getPeer());
+      } else {
+        LOG(WARNING) << "Fetch chunk failed " << fetchChunkRetryCnt_ << "/"
+                     << fetchChunkMaxRetry_ << " times for location "
+                     << failedLocation.hostAndFetchPort()
+                     << ". Error: " << e.what();
+        std::this_thread::sleep_for(retryWait_);
+        // TODO: Pass checkpoint metadata when supported to skip
+        // already-read chunks, improving retry performance.
+        currReader_ = createReaderWithRetry(failedLocation);
+      }
+    }
+  }
+
+  CELEBORN_FAIL("Fetch chunk failed!");
+}
+
+void CelebornInputStream::verifyChunk(
+    const std::unique_ptr<memory::ReadOnlyByteBuffer>& chunk) {
+  auto data = chunk->clone();
+  while (data->remainingSize() > 0) {
+    CELEBORN_CHECK_GE(data->remainingSize(), 4 * 4);
+    // TODO: in java this is UNSAFE and PLATFORM related. hand-crafted here,
+    // might not be safe.
+    int mapId = data->readLE<int>();
+    int attemptId = data->readLE<int>();
+    int batchId = data->readLE<int>();
+    int size = data->readLE<int>();
+    CELEBORN_CHECK_GE(data->remainingSize(), size);
+    CELEBORN_CHECK_LT(mapId, attempts_.size());
+    data->skip(size);
+  }
+}
+
+void CelebornInputStream::moveToNextReader() {
+  cleanupReader();
+  auto location = nextReadableLocation();
+  if (!location) {
+    return;
+  }
+  fetchChunkRetryCnt_ = 0;
+  currReader_ = createReaderWithRetry(*location);
+  currLocationIndex_++;
+  if (currReader_->hasNext()) {
+    currChunk_ = getNextChunk();
+    if (currChunk_) {
+      return;
+    }
+  }
+  moveToNextReader();
+}
+
+std::shared_ptr<PartitionReader> CelebornInputStream::createReaderWithRetry(
+    const protocol::PartitionLocation& location) {
+  const protocol::PartitionLocation* currentLocation = &location;
+  std::exception_ptr lastException;
+
+  while (fetchChunkRetryCnt_ < fetchChunkMaxRetry_) {
+    // TODO (Investigate): When a location is already in the exclusion list, the
+    // code throws and then retries/sleeps (especially in the no-peer branch).
+    // Since isExcluded(*currentLocation) will keep returning true until the
+    // exclusion expires, these retries are guaranteed to fail and just add
+    // delay. Consider failing fast (no sleep/retry) or skipping to another
+    // available location/peer when the current location is excluded.
+    try {
+      VLOG(1) << "Create reader for location " << currentLocation->host << ":"
+              << currentLocation->fetchPort;
+      if (isExcluded(*currentLocation)) {
+        CELEBORN_FAIL(
+            "Fetch data from excluded worker! {}",
+            currentLocation->hostAndFetchPort());
+      }
+      auto reader = createReader(*currentLocation);
+      return reader;
+    } catch (const std::exception& e) {
+      lastException = std::current_exception();
+      shuffleClient_->excludeFailedFetchLocation(
+          currentLocation->hostAndFetchPort(), e);
+      fetchChunkRetryCnt_++;
+
+      if (currentLocation->hasPeer() && !readSkewPartitionWithoutMapRange_) {
+        if (fetchChunkRetryCnt_ % 2 == 0) {
+          std::this_thread::sleep_for(retryWait_);
+        }
+        LOG(WARNING) << "CreatePartitionReader failed " << fetchChunkRetryCnt_
+                     << "/" << fetchChunkMaxRetry_ << " times for location "
+                     << currentLocation->hostAndFetchPort()
+                     << ", change to peer. Error: " << e.what();
+        // TODO: When stream handlers are supported, send BUFFER_STREAM_END
+        // to close the active stream before switching to peer, matching the
+        // Java CelebornInputStream behavior. Currently, the C++ client does
+        // not have pre-opened stream handlers, so stream cleanup is handled
+        // by WorkerPartitionReader's destructor.
+        currentLocation = currentLocation->getPeer();
+      } else {
+        LOG(WARNING) << "CreatePartitionReader failed " << fetchChunkRetryCnt_
+                     << "/" << fetchChunkMaxRetry_ << " times for location "
+                     << currentLocation->hostAndFetchPort()
+                     << ", retry the same location. Error: " << e.what();
+        std::this_thread::sleep_for(retryWait_);
+      }
+    }
+  }
+
+  // Max retries exceeded, rethrow the last exception wrapped with context
+  std::string errorMessage = "createPartitionReader failed after " +
+      std::to_string(fetchChunkRetryCnt_) +
+      " retries. Original location: " + location.hostAndFetchPort() +
+      ", last attempted location: " + currentLocation->hostAndFetchPort();
+  throw utils::CelebornRuntimeError(lastException, errorMessage, false);
+}
+
+std::shared_ptr<PartitionReader> CelebornInputStream::createReader(
+    const protocol::PartitionLocation& location) {
+  switch (location.storageInfo->type) {
+    case protocol::StorageInfo::HDD:
+    case protocol::StorageInfo::SSD: {
+      // TODO: support localPartitionReader...
+      return WorkerPartitionReader::create(
+          conf_,
+          shuffleKey_,
+          location,
+          startMapIndex_,
+          endMapIndex_,
+          clientFactory_.get());
+    }
+    case protocol::StorageInfo::HDFS:
+    default:
+      // TODO: support DfsPartitionReader...
+      CELEBORN_FAIL(
+          "unsupported protocol::StorageInfo type " +
+          std::to_string(location.storageInfo->type));
+  }
+}
+
+std::shared_ptr<const protocol::PartitionLocation>
+CelebornInputStream::nextReadableLocation() {
+  if (currLocationIndex_ >= locations_.size()) {
+    return nullptr;
+  }
+  return locations_[currLocationIndex_];
+  // TODO: support skipLocation functionality...
+  // TODO: the currLocationIndex_ management is a mess. might be
+  // managed all within this function?
+}
+
+std::unordered_set<int>& CelebornInputStream::getBatchRecord(int mapId) {
+  batchRecords_.resize(mapId + 1);
+  if (!batchRecords_[mapId]) {
+    batchRecords_[mapId] = std::make_unique<std::unordered_set<int>>();
+  }
+  return *batchRecords_[mapId];
+}
+
+bool CelebornInputStream::isPushFailedBatch(
+    const std::string& partitionUniqueId,
+    int mapId,
+    int attemptId,
+    int batchId) const {
+  if (!pushFailedBatches_) {
+    return false;
+  }
+  auto locationIt = pushFailedBatches_->find(partitionUniqueId);
+  if (locationIt == pushFailedBatches_->end()) {
+    return false;
+  }
+  auto attemptIt =
+      locationIt->second.find(utils::makeAttemptKey(mapId, attemptId));
+  return attemptIt != locationIt->second.end() &&
+      attemptIt->second.count(batchId) > 0;
+}
+
+bool CelebornInputStream::isExcluded(
+    const protocol::PartitionLocation& location) {
+  auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now().time_since_epoch())
+                 .count();
+  auto timestamp = fetchExcludedWorkers_->get(location.hostAndFetchPort());
+  if (!timestamp.has_value()) {
+    return false;
+  }
+  if (now - timestamp.value() > fetchExcludedWorkerExpireTimeoutMs_) {
+    fetchExcludedWorkers_->erase(location.hostAndFetchPort());
+    return false;
+  }
+  if (location.hasPeer()) {
+    auto peerTimestamp =
+        fetchExcludedWorkers_->get(location.getPeer()->hostAndFetchPort());
+    // To avoid both replicate locations being excluded, if peer was added to
+    // excluded list earlier, change to try peer.
+    if (!peerTimestamp.has_value() ||
+        peerTimestamp.value() < timestamp.value()) {
+      return true;
+    }
+    return false;
+  }
+  return true;
+}
+
+void CelebornInputStream::cleanupReader() {
+  currReader_ = nullptr;
+}
+} // namespace client
+} // namespace celeborn

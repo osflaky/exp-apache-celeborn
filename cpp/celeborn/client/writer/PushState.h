@@ -1,0 +1,138 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <atomic>
+#include <map>
+#include <optional>
+#include <set>
+#include <string>
+
+#include "celeborn/client/writer/DataBatches.h"
+#include "celeborn/client/writer/PushStrategy.h"
+#include "celeborn/conf/CelebornConf.h"
+#include "celeborn/protocol/PushFailedBatches.h"
+#include "celeborn/utils/CelebornUtils.h"
+
+namespace celeborn {
+namespace client {
+
+class PushStrategy;
+
+/// Records the states of a mapKey, including the ongoing package number id, the
+/// exception, etc. Besides, the congestionControl is also enforced.
+class PushState {
+ public:
+  PushState(const conf::CelebornConf& conf);
+
+  int nextBatchId();
+
+  void
+  addBatch(int batchId, int batchBytesSize, const std::string& hostAndPushPort);
+
+  void onSuccess(const std::string& hostAndPushPort);
+
+  void onCongestControl(const std::string& hostAndPushPort);
+
+  void removeBatch(int batchId, const std::string& hostAndPushPort);
+
+  // Check if the host's ongoing package num reaches the max limit, if so,
+  // block until the ongoing package num decreases below max limit. If the
+  // limit operation succeeds before timeout, return false, otherwise return
+  // true.
+  // When maxBytesSizeInFlight is enabled, the limit check considers both
+  // request count and byte size limits. The push is allowed if either:
+  // 1. Request count is within limits, or
+  // 2. Byte size is within limits (when enabled)
+  bool limitMaxInFlight(const std::string& hostAndPushPort);
+
+  // Check if the pushState's ongoing package num reaches zero, if not, block
+  // until the ongoing package num decreases to zero. If the limit operation
+  // succeeds before timeout, return false, otherwise return true.
+  bool limitZeroInFlight();
+
+  bool exceptionExists() const;
+
+  void setException(std::unique_ptr<std::exception> exception);
+
+  std::optional<std::string> getExceptionMsg() const;
+
+  void cleanup();
+
+  // Merge-related: accumulate batch data grouped by address pair.
+  // Returns true when totalSize for that address pair exceeds
+  // pushBufferMaxSize.
+  bool addBatchData(
+      const std::string& addressPairKey,
+      std::shared_ptr<const protocol::PartitionLocation> loc,
+      int batchId,
+      std::unique_ptr<memory::ReadOnlyByteBuffer> body);
+
+  std::shared_ptr<DataBatches> takeDataBatches(
+      const std::string& addressPairKey);
+
+  utils::ConcurrentHashMap<std::string, std::shared_ptr<DataBatches>>&
+  getBatchesMap();
+
+  // Record a failed push batch for the adaptive skewed-partition read
+  // optimization (Java PushState#recordFailedBatch). Keyed by
+  // partitionUniqueId -> "<mapId>-<attemptId>" -> set of batchIds.
+  void recordFailedBatch(
+      const std::string& partitionUniqueId,
+      int mapId,
+      int attemptId,
+      int batchId);
+
+  // Snapshot of the recorded failed batches.
+  protocol::PartitionPushFailedBatches getFailedBatches() const;
+
+  // Moves the recorded failed batches out (no deep copy under the lock). Used
+  // at mapperEnd, after which this PushState is discarded.
+  protocol::PartitionPushFailedBatches takeFailedBatches();
+
+ private:
+  void throwIfExceptionExists();
+
+  std::atomic<int> currBatchId_{1};
+  std::atomic<long> totalInflightReqs_{0};
+  std::atomic<long> totalInflightBytes_{0};
+  const long waitInflightTimeoutMs_;
+  const long deltaMs_;
+  const std::unique_ptr<PushStrategy> pushStrategy_;
+  const int maxInFlightReqsTotal_;
+  const int pushBufferMaxSize_;
+  const bool maxInFlightBytesSizeEnabled_;
+  const long maxInFlightBytesSizeTotal_;
+  const long maxInFlightBytesSizePerWorker_;
+  utils::ConcurrentHashMap<
+      std::string,
+      std::shared_ptr<utils::ConcurrentHashSet<int>>>
+      inflightBatchesPerAddress_;
+  utils::ConcurrentHashMap<std::string, std::shared_ptr<std::atomic<long>>>
+      inflightBytesSizePerAddress_;
+  utils::ConcurrentHashMap<int, int> inflightBatchBytesSizes_;
+  utils::ConcurrentHashMap<std::string, std::shared_ptr<DataBatches>>
+      batchesMap_;
+  // partitionUniqueId -> "<mapId>-<attemptId>" -> failed batchIds.
+  folly::Synchronized<protocol::PartitionPushFailedBatches> failedBatches_;
+  folly::Synchronized<std::unique_ptr<std::exception>> exception_;
+  std::atomic<bool> cleaned_{false};
+};
+
+} // namespace client
+} // namespace celeborn
